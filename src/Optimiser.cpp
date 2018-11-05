@@ -630,19 +630,9 @@ struct SpWeightComparator
     }
 };
 
-void Optimiser::expectation()
+void Optimiser::doGlobalSearch(int nPer)
 {
-    IF_MASTER return;
 
-    int nPer = 0;
-
-    ALOG(INFO, "LOGGER_ROUND") << "Allocating Space for Pre-calcuation in Expectation";
-    BLOG(INFO, "LOGGER_ROUND") << "Allocating Space for Pre-calcuation in Expectation";
-
-    allocPreCalIdx(_r, _rL);
-
-    if (_searchType == SEARCH_TYPE_GLOBAL)
-    {
         if (_searchType != SEARCH_TYPE_CTF)
             allocPreCal(true, true, false);
         else
@@ -1144,6 +1134,320 @@ void Optimiser::expectation()
             freePreCal(false);
         else
             freePreCal(true);
+}
+
+void Optimiser::updateSP(size_t& c, dvec2& t, double& d, dmat22& rot2D, dmat33& rot3D, Complex*& priRotP, Complex*& priAllP, vec& wC, vec& wR, vec& wT, vec& wD, int phase, ptrdiff_t l, Complex* poolTraP, RFLOAT* poolCtfP)
+{
+#ifdef OPTIMISER_GLOBAL_PERTURB_LARGE
+    if (phase == (_searchType == SEARCH_TYPE_GLOBAL) ? 1 : 0)
+#else
+    if (phase == 0)
+#endif
+    {
+        _par[l].perturb(_para.perturbFactorL, PAR_R);
+        _par[l].perturb(_para.perturbFactorL, PAR_T);
+
+        if (_searchType == SEARCH_TYPE_CTF)
+            _par[l].initD(_para.mLD, _para.ctfRefineS);
+    }
+    else
+    {
+        _par[l].perturb((_searchType == SEARCH_TYPE_GLOBAL)
+                      ? _para.perturbFactorSGlobal
+                      : _para.perturbFactorSLocal,
+                        PAR_R);
+        _par[l].perturb((_searchType == SEARCH_TYPE_GLOBAL)
+                      ? _para.perturbFactorSGlobal
+                      : _para.perturbFactorSLocal,
+                        PAR_T);
+
+        if (_searchType == SEARCH_TYPE_CTF)
+            _par[l].perturb(_para.perturbFactorSCTF, PAR_D);
+    }
+
+    RFLOAT baseLine = GSL_NAN;
+
+    FOR_EACH_C(_par[l])
+    {
+        _par[l].c(c, iC);
+
+        Complex* traP = poolTraP + _par[l].nT() * _nPxl * omp_get_thread_num();
+
+        FOR_EACH_T(_par[l])
+        {
+            _par[l].t(t, iT);
+
+            translate(traP + iT * _nPxl,
+                      t(0),
+                      t(1),
+                      _para.size,
+                      _para.size,
+                      _iCol,
+                      _iRow,
+                      _nPxl,
+                      _para.nThreadsPerProcess);
+        }
+
+        RFLOAT* ctfP;
+
+        if (_searchType == SEARCH_TYPE_CTF)
+        {
+            ctfP = poolCtfP + _par[l].nD() * _nPxl * omp_get_thread_num();
+
+            FOR_EACH_D(_par[l])
+            {
+                _par[l].d(d, iD);
+
+                for (int i = 0; i < _nPxl; i++)
+                {
+                    RFLOAT ki = _K1[l]
+                              * _defocusP[l * _nPxl + i]
+                              * d
+                              * TSGSL_pow_2(_frequency[i])
+                              + _K2[l]
+                              * TSGSL_pow_4(_frequency[i])
+                              - _ctfAttr[l].phaseShift;
+
+                    //ctfP[_nPxl * iD + i] = -w1 * TS_SIN(ki) + w2 * TS_COS(ki);
+                    ctfP[_nPxl * iD + i] = -TS_SQRT(1 - TSGSL_pow_2(_ctfAttr[l].amplitudeContrast))
+                                         * TS_SIN(ki)
+                                         + _ctfAttr[l].amplitudeContrast
+                                         * TS_COS(ki);
+                }
+            }
+        }
+
+        FOR_EACH_R(_par[l])
+        {
+            if (_para.mode == MODE_2D)
+            {
+                _par[l].rot(rot2D, iR);
+            }
+            else if (_para.mode == MODE_3D)
+            {
+                _par[l].rot(rot3D, iR);
+            }
+            else
+            {
+                REPORT_ERROR("INEXISTENT MODE");
+
+                abort();
+            }
+
+            if (_para.mode == MODE_2D)
+            {
+                _model.proj(c).project(priRotP,
+                                       rot2D,
+                                       _iCol,
+                                       _iRow,
+                                       _nPxl,
+                                       _para.nThreadsPerProcess);
+            }
+            else if (_para.mode == MODE_3D)
+            {
+                _model.proj(c).project(priRotP,
+                                       rot3D,
+                                       _iCol,
+                                       _iRow,
+                                       _nPxl,
+                                       _para.nThreadsPerProcess);
+            }
+            else
+            {
+                REPORT_ERROR("INEXISTENT MODE");
+
+                abort();
+            }
+
+            FOR_EACH_T(_par[l])
+            {
+                for (int i = 0; i < _nPxl; i++)
+                    priAllP[i] = traP[_nPxl * iT + i] * priRotP[i];
+
+                FOR_EACH_D(_par[l])
+                {
+                    _par[l].d(d, iD);
+
+                    RFLOAT w;
+
+#ifdef ENABLE_SIMD_512
+                    if (_searchType != SEARCH_TYPE_CTF)
+                    {
+                        w = logDataVSPrior_m_huabin_SIMD512(_datP + l * _nPxl,
+                                           priAllP,
+                                           _ctfP + l * _nPxl,
+                                           _sigRcpP + l * _nPxl,
+                                           _nPxl);
+                    }
+                    else
+                    {
+                        w = logDataVSPrior_m_huabin_SIMD512(_datP + l * _nPxl,
+                                           priAllP,
+                                           ctfP + iD * _nPxl,
+                                           _sigRcpP + l * _nPxl,
+                                           _nPxl);
+                    }
+#else
+#ifdef ENABLE_SIMD_256
+                    if (_searchType != SEARCH_TYPE_CTF)
+                    {
+                        w = logDataVSPrior_m_huabin_SIMD256(_datP + l * _nPxl,
+                                           priAllP,
+                                           _ctfP + l * _nPxl,
+                                           _sigRcpP + l * _nPxl,
+                                           _nPxl);
+                    }
+                    else
+                    {
+                        w = logDataVSPrior_m_huabin_SIMD256(_datP + l * _nPxl,
+                                           priAllP,
+                                           ctfP + iD * _nPxl,
+                                           _sigRcpP + l * _nPxl,
+                                           _nPxl);
+                    }
+#else
+                    if (_searchType != SEARCH_TYPE_CTF)
+                    {
+                        w = logDataVSPrior_m_huabin(_datP + l * _nPxl,
+                                           priAllP,
+                                           _ctfP + l * _nPxl,
+                                           _sigRcpP + l * _nPxl,
+                                           _nPxl);
+                    }
+                    else
+                    {
+                        w = logDataVSPrior_m_huabin(_datP + l * _nPxl,
+                                           priAllP,
+                                           ctfP + iD * _nPxl,
+                                           _sigRcpP + l * _nPxl,
+                                           _nPxl);
+                    }
+#endif
+#endif
+                    
+                    baseLine = TSGSL_isnan(baseLine) ? w : baseLine;
+
+                    if (w > baseLine)
+                    {
+                        RFLOAT nf = exp(baseLine - w);
+
+                        wC *= nf;
+                        wR *= nf;
+                        wT *= nf;
+                        wD *= nf;
+
+                        baseLine = w;
+                    }
+
+                    RFLOAT s = exp(w - baseLine);
+
+                    wC(iC) += s * (_par[l].wR(iR) * _par[l].wT(iT) * _par[l].wD(iD));
+                    wR(iR) += s * (_par[l].wC(iC) * _par[l].wT(iT) * _par[l].wD(iD));
+                    wT(iT) += s * (_par[l].wC(iC) * _par[l].wR(iR) * _par[l].wD(iD));
+                    wD(iD) += s * (_par[l].wC(iC) * _par[l].wR(iR) * _par[l].wT(iT));
+                }
+            }
+        }
+    }
+
+    _par[l].setUC(wC(0), 0);
+
+    for (int iR = 0; iR < _para.mLR; iR++)
+        _par[l].setUR(wR(iR), iR);
+
+#ifdef OPTIMISER_PEAK_FACTOR_R
+    _par[l].keepHalfHeightPeak(PAR_R);
+#endif
+
+    for (int iT = 0; iT < _para.mLT; iT++)
+        _par[l].setUT(wT(iT), iT);
+
+#ifdef OPTIMISER_PEAK_FACTOR_T
+    _par[l].keepHalfHeightPeak(PAR_T);
+#endif
+
+    if (_searchType == SEARCH_TYPE_CTF)
+    {
+        for (int iD = 0; iD < _para.mLD; iD++)
+            _par[l].setUD(wD(iD), iD);
+
+#ifdef OPTIMISER_PEAK_FACTOR_D
+        if (phase == 0) _par[l].setPeakFactor(PAR_D);
+
+        _par[l].keepHalfHeightPeak(PAR_D);
+#endif
+    }
+
+#ifdef OPTIMISER_SAVE_PARTICLES
+    if (_ID[l] < N_SAVE_IMG)
+    {
+        _par[l].sort();
+
+        char filename[FILE_NAME_LENGTH];
+
+        snprintf(filename,
+                 sizeof(filename),
+                 "C_Particle_%04d_Round_%03d_%03d.par",
+                 _ID[l],
+                 _iter,
+                 phase);
+        save(filename, _par[l], PAR_C, true);
+        snprintf(filename,
+                 sizeof(filename),
+                 "R_Particle_%04d_Round_%03d_%03d.par",
+                 _ID[l],
+                 _iter,
+                 phase);
+        save(filename, _par[l], PAR_R, true);
+        snprintf(filename,
+                 sizeof(filename),
+                 "T_Particle_%04d_Round_%03d_%03d.par",
+                 _ID[l],
+                 _iter,
+                 phase);
+        save(filename, _par[l], PAR_T, true);
+        snprintf(filename,
+                 sizeof(filename),
+                 "D_Particle_%04d_Round_%03d_%03d.par",
+                 _ID[l],
+                 _iter,
+                 phase);
+        save(filename, _par[l], PAR_D, true);
+    }
+#endif
+
+    _par[l].calRank1st(PAR_R);
+    _par[l].calRank1st(PAR_T);
+
+    _par[l].calVari(PAR_R);
+    _par[l].calVari(PAR_T);
+
+    _par[l].resample(_para.mLR, PAR_R);
+    _par[l].resample(_para.mLT, PAR_T);
+
+    if (_searchType == SEARCH_TYPE_CTF)
+    {
+        _par[l].calRank1st(PAR_D);
+        _par[l].calVari(PAR_D);
+        _par[l].resample(_para.mLD, PAR_D);
+    }
+
+}
+void Optimiser::expectation()
+{
+    IF_MASTER return;
+
+    int nPer = 0;
+
+    ALOG(INFO, "LOGGER_ROUND") << "Allocating Space for Pre-calcuation in Expectation";
+    BLOG(INFO, "LOGGER_ROUND") << "Allocating Space for Pre-calcuation in Expectation";
+
+    allocPreCalIdx(_r, _rL);
+
+    if (_searchType == SEARCH_TYPE_GLOBAL)
+    {
+
+        doGlobalSearch(nPer);
     }
 
 #ifdef OPTIMISER_PARTICLE_FILTER
@@ -1193,34 +1497,7 @@ void Optimiser::expectation()
 #endif
         for (int phase = (_searchType == SEARCH_TYPE_GLOBAL) ? 1 : 0; phase < MAX_N_PHASE_PER_ITER; phase++)
         {
-#ifdef OPTIMISER_GLOBAL_PERTURB_LARGE
-            if (phase == (_searchType == SEARCH_TYPE_GLOBAL) ? 1 : 0)
-#else
-            if (phase == 0)
-#endif
-            {
-                _par[l].perturb(_para.perturbFactorL, PAR_R);
-                _par[l].perturb(_para.perturbFactorL, PAR_T);
-
-                if (_searchType == SEARCH_TYPE_CTF)
-                    _par[l].initD(_para.mLD, _para.ctfRefineS);
-            }
-            else
-            {
-                _par[l].perturb((_searchType == SEARCH_TYPE_GLOBAL)
-                              ? _para.perturbFactorSGlobal
-                              : _para.perturbFactorSLocal,
-                                PAR_R);
-                _par[l].perturb((_searchType == SEARCH_TYPE_GLOBAL)
-                              ? _para.perturbFactorSGlobal
-                              : _para.perturbFactorSLocal,
-                                PAR_T);
-
-                if (_searchType == SEARCH_TYPE_CTF)
-                    _par[l].perturb(_para.perturbFactorSCTF, PAR_D);
-            }
   
-            RFLOAT baseLine = GSL_NAN;
 
             vec wC = vec::Zero(1);
             vec wR = vec::Zero(_para.mLR);
@@ -1233,290 +1510,8 @@ void Optimiser::expectation()
             double d;
             dvec2 t;
 
-            FOR_EACH_C(_par[l])
-            {
-                _par[l].c(c, iC);
-
-                Complex* traP = poolTraP + _par[l].nT() * _nPxl * omp_get_thread_num();
-
-                FOR_EACH_T(_par[l])
-                {
-                    _par[l].t(t, iT);
-
-                    translate(traP + iT * _nPxl,
-                              t(0),
-                              t(1),
-                              _para.size,
-                              _para.size,
-                              _iCol,
-                              _iRow,
-                              _nPxl,
-                              _para.nThreadsPerProcess);
-                }
-
-                RFLOAT* ctfP;
-
-                if (_searchType == SEARCH_TYPE_CTF)
-                {
-                    ctfP = poolCtfP + _par[l].nD() * _nPxl * omp_get_thread_num();
-
-                    FOR_EACH_D(_par[l])
-                    {
-                        _par[l].d(d, iD);
-
-                        for (int i = 0; i < _nPxl; i++)
-                        {
-                            RFLOAT ki = _K1[l]
-                                      * _defocusP[l * _nPxl + i]
-                                      * d
-                                      * TSGSL_pow_2(_frequency[i])
-                                      + _K2[l]
-                                      * TSGSL_pow_4(_frequency[i])
-                                      - _ctfAttr[l].phaseShift;
-
-                            //ctfP[_nPxl * iD + i] = -w1 * TS_SIN(ki) + w2 * TS_COS(ki);
-                            ctfP[_nPxl * iD + i] = -TS_SQRT(1 - TSGSL_pow_2(_ctfAttr[l].amplitudeContrast))
-                                                 * TS_SIN(ki)
-                                                 + _ctfAttr[l].amplitudeContrast
-                                                 * TS_COS(ki);
-                        }
-                    }
-                }
-
-                FOR_EACH_R(_par[l])
-                {
-                    if (_para.mode == MODE_2D)
-                    {
-                        _par[l].rot(rot2D, iR);
-                    }
-                    else if (_para.mode == MODE_3D)
-                    {
-                        _par[l].rot(rot3D, iR);
-                    }
-                    else
-                    {
-                        REPORT_ERROR("INEXISTENT MODE");
-
-                        abort();
-                    }
-
-                    if (_para.mode == MODE_2D)
-                    {
-                        _model.proj(c).project(priRotP,
-                                               rot2D,
-                                               _iCol,
-                                               _iRow,
-                                               _nPxl,
-                                               _para.nThreadsPerProcess);
-                    }
-                    else if (_para.mode == MODE_3D)
-                    {
-                        _model.proj(c).project(priRotP,
-                                               rot3D,
-                                               _iCol,
-                                               _iRow,
-                                               _nPxl,
-                                               _para.nThreadsPerProcess);
-                    }
-                    else
-                    {
-                        REPORT_ERROR("INEXISTENT MODE");
-
-                        abort();
-                    }
-
-                    FOR_EACH_T(_par[l])
-                    {
-                        for (int i = 0; i < _nPxl; i++)
-                            priAllP[i] = traP[_nPxl * iT + i] * priRotP[i];
-
-                        FOR_EACH_D(_par[l])
-                        {
-                            _par[l].d(d, iD);
-
-                            RFLOAT w;
-
-#ifdef ENABLE_SIMD_512
-                            if (_searchType != SEARCH_TYPE_CTF)
-                            {
-                                w = logDataVSPrior_m_huabin_SIMD512(_datP + l * _nPxl,
-                                                   priAllP,
-                                                   _ctfP + l * _nPxl,
-                                                   _sigRcpP + l * _nPxl,
-                                                   _nPxl);
-                            }
-                            else
-                            {
-                                w = logDataVSPrior_m_huabin_SIMD512(_datP + l * _nPxl,
-                                                   priAllP,
-                                                   ctfP + iD * _nPxl,
-                                                   _sigRcpP + l * _nPxl,
-                                                   _nPxl);
-                            }
-#else
-#ifdef ENABLE_SIMD_256
-                            if (_searchType != SEARCH_TYPE_CTF)
-                            {
-                                w = logDataVSPrior_m_huabin_SIMD256(_datP + l * _nPxl,
-                                                   priAllP,
-                                                   _ctfP + l * _nPxl,
-                                                   _sigRcpP + l * _nPxl,
-                                                   _nPxl);
-                            }
-                            else
-                            {
-                                w = logDataVSPrior_m_huabin_SIMD256(_datP + l * _nPxl,
-                                                   priAllP,
-                                                   ctfP + iD * _nPxl,
-                                                   _sigRcpP + l * _nPxl,
-                                                   _nPxl);
-                            }
-#else
-                            if (_searchType != SEARCH_TYPE_CTF)
-                            {
-                                w = logDataVSPrior_m_huabin(_datP + l * _nPxl,
-                                                   priAllP,
-                                                   _ctfP + l * _nPxl,
-                                                   _sigRcpP + l * _nPxl,
-                                                   _nPxl);
-                            }
-                            else
-                            {
-                                w = logDataVSPrior_m_huabin(_datP + l * _nPxl,
-                                                   priAllP,
-                                                   ctfP + iD * _nPxl,
-                                                   _sigRcpP + l * _nPxl,
-                                                   _nPxl);
-                            }
-#endif
-#endif
-                            
-                            baseLine = TSGSL_isnan(baseLine) ? w : baseLine;
-
-                            if (w > baseLine)
-                            {
-                                RFLOAT nf = exp(baseLine - w);
-
-                                wC *= nf;
-                                wR *= nf;
-                                wT *= nf;
-                                wD *= nf;
-
-                                baseLine = w;
-                            }
-
-                            RFLOAT s = exp(w - baseLine);
-
-                            wC(iC) += s * (_par[l].wR(iR) * _par[l].wT(iT) * _par[l].wD(iD));
-                            wR(iR) += s * (_par[l].wC(iC) * _par[l].wT(iT) * _par[l].wD(iD));
-                            wT(iT) += s * (_par[l].wC(iC) * _par[l].wR(iR) * _par[l].wD(iD));
-                            wD(iD) += s * (_par[l].wC(iC) * _par[l].wR(iR) * _par[l].wT(iT));
-                        }
-                    }
-                }
-            }
-
-            _par[l].setUC(wC(0), 0);
-
-            for (int iR = 0; iR < _para.mLR; iR++)
-                _par[l].setUR(wR(iR), iR);
-
-#ifdef OPTIMISER_PEAK_FACTOR_R
-            _par[l].keepHalfHeightPeak(PAR_R);
-#endif
-
-            for (int iT = 0; iT < _para.mLT; iT++)
-                _par[l].setUT(wT(iT), iT);
-
-#ifdef OPTIMISER_PEAK_FACTOR_T
-            _par[l].keepHalfHeightPeak(PAR_T);
-#endif
-
-            if (_searchType == SEARCH_TYPE_CTF)
-            {
-                for (int iD = 0; iD < _para.mLD; iD++)
-                    _par[l].setUD(wD(iD), iD);
-
-#ifdef OPTIMISER_PEAK_FACTOR_D
-                if (phase == 0) _par[l].setPeakFactor(PAR_D);
-
-                _par[l].keepHalfHeightPeak(PAR_D);
-#endif
-            }
-
-#ifdef OPTIMISER_SAVE_PARTICLES
-            if (_ID[l] < N_SAVE_IMG)
-            {
-                _par[l].sort();
-
-                char filename[FILE_NAME_LENGTH];
-
-                snprintf(filename,
-                         sizeof(filename),
-                         "C_Particle_%04d_Round_%03d_%03d.par",
-                         _ID[l],
-                         _iter,
-                         phase);
-                save(filename, _par[l], PAR_C, true);
-                snprintf(filename,
-                         sizeof(filename),
-                         "R_Particle_%04d_Round_%03d_%03d.par",
-                         _ID[l],
-                         _iter,
-                         phase);
-                save(filename, _par[l], PAR_R, true);
-                snprintf(filename,
-                         sizeof(filename),
-                         "T_Particle_%04d_Round_%03d_%03d.par",
-                         _ID[l],
-                         _iter,
-                         phase);
-                save(filename, _par[l], PAR_T, true);
-                snprintf(filename,
-                         sizeof(filename),
-                         "D_Particle_%04d_Round_%03d_%03d.par",
-                         _ID[l],
-                         _iter,
-                         phase);
-                save(filename, _par[l], PAR_D, true);
-            }
-#endif
-
-            _par[l].calRank1st(PAR_R);
-            _par[l].calRank1st(PAR_T);
-
-            _par[l].calVari(PAR_R);
-            _par[l].calVari(PAR_T);
-
-            _par[l].resample(_para.mLR, PAR_R);
-            _par[l].resample(_para.mLT, PAR_T);
-
-            if (_searchType == SEARCH_TYPE_CTF)
-            {
-                _par[l].calRank1st(PAR_D);
-                _par[l].calVari(PAR_D);
-                _par[l].resample(_para.mLD, PAR_D);
-            }
-
-            /***
-            RFLOAT k1 = _par[l].k1();
-            RFLOAT s0 = _par[l].s0();
-            RFLOAT s1 = _par[l].s1();
-
-            _par[l].resample(_para.mLR, PAR_R);
-            _par[l].resample(_para.mLT, PAR_T);
-
-            _par[l].calVari(PAR_R);
-            _par[l].calVari(PAR_T);
-
-            _par[l].setK1(TSGSL_MAX_RFLOAT(k1 * gsl_pow_2(MIN_STD_FACTOR
-                                                   * pow(_par[l].nR(), -1.0 / 3)),
-                                      _par[l].k1()));
-
-            _par[l].setS0(TSGSL_MAX_RFLOAT(MIN_STD_FACTOR * s0 / sqrt(_par[l].nT()), _par[l].s0()));
-
-            _par[l].setS1(TSGSL_MAX_RFLOAT(MIN_STD_FACTOR * s1 / sqrt(_par[l].nT()), _par[l].s1()));
-            ***/
+            //Refactor by huabin
+            updateSP(c, t, d, rot2D, rot3D, priRotP, priAllP, wC, wR, wT, wD, phase, l, poolTraP, poolCtfP);
 
             if (phase >= ((_searchType == SEARCH_TYPE_GLOBAL)
                         ? MIN_N_PHASE_PER_ITER_GLOBAL

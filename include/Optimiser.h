@@ -977,6 +977,9 @@ class Optimiser : public Parallel
         void saveSig() const;
 
         void saveTau() const;
+        void doGlobalSearch(int nPer);
+        void updateSP(size_t& c, dvec2& t, double& d, dmat22& rot2D, dmat33& rot3D, Complex*& priRotP, Complex*& priAllP, vec& wC, vec& wR, vec& wT, vec& wD, int phase, ptrdiff_t l, Complex* poolTraP, RFLOAT* poolCtfP);
+
 };
 
 /***
