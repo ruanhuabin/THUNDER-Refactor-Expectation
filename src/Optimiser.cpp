@@ -1325,6 +1325,8 @@ void Optimiser::updateSP(size_t& c, dvec2& t, double& d, dmat22& rot2D, dmat33& 
 #endif
 #endif
                     
+
+
                     baseLine = TSGSL_isnan(baseLine) ? w : baseLine;
 
                     if (w > baseLine)
@@ -1446,7 +1448,6 @@ void Optimiser::expectation()
 
     if (_searchType == SEARCH_TYPE_GLOBAL)
     {
-
         doGlobalSearch(nPer);
     }
 
@@ -1461,15 +1462,12 @@ void Optimiser::expectation()
 
     _nF = 0;
     _nI = 0;
-
     nPer = 0;
     
     Complex* poolPriRotP = (Complex*)TSFFTW_malloc(_nPxl * omp_get_max_threads() * sizeof(Complex));
     Complex* poolPriAllP = (Complex*)TSFFTW_malloc(_nPxl * omp_get_max_threads() * sizeof(Complex));
-
     Complex* poolTraP = (Complex*)TSFFTW_malloc(_para.mLT * _nPxl * omp_get_max_threads() * sizeof(Complex));
-
-    RFLOAT* poolCtfP;
+    RFLOAT* poolCtfP = NULL;
 
     if (_searchType == SEARCH_TYPE_CTF)
         poolCtfP = (RFLOAT*)TSFFTW_malloc(_para.mLD * _nPxl * omp_get_max_threads() * sizeof(RFLOAT));
@@ -1477,10 +1475,8 @@ void Optimiser::expectation()
     #pragma omp parallel for schedule(dynamic)
     FOR_EACH_2D_IMAGE
     {
-
         Complex* priRotP = poolPriRotP + _nPxl * omp_get_thread_num();
         Complex* priAllP = poolPriAllP + _nPxl * omp_get_thread_num();
-
         int nPhaseWithNoVariDecrease = 0;
 
 #ifdef OPTIMISER_COMPRESS_CRITERIA
@@ -1497,8 +1493,6 @@ void Optimiser::expectation()
 #endif
         for (int phase = (_searchType == SEARCH_TYPE_GLOBAL) ? 1 : 0; phase < MAX_N_PHASE_PER_ITER; phase++)
         {
-  
-
             vec wC = vec::Zero(1);
             vec wR = vec::Zero(_para.mLR);
             vec wT = vec::Zero(_para.mLT);
